@@ -1,5 +1,5 @@
 // ==========================================
-// โค้ดเวอร์ชันพร้อมขึ้นออนไลน์ (Production Ready)
+// โค้ดเวอร์ชันพร้อมขึ้นออนไลน์ + ระบบ Real-time (SSE)
 // ==========================================
 
 const express = require('express');
@@ -10,16 +10,15 @@ const fs = require('fs');
 require('dotenv').config();
 
 const app = express();
-// อนุญาตให้หน้าเว็บ (Frontend) จากทุกโดเมนมาดึงข้อมูลได้
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST'],
-}));
+app.use(cors({ origin: '*', methods: ['GET', 'POST'] }));
+app.use(express.json()); // รองรับการรับข้อมูลแบบ JSON
 
-// ตั้งค่า Cache ให้อยู่ได้ 60 วินาที
-const cache = new NodeCache({ stdTTL: 60 });
+// ตั้งค่า Cache ให้อยู่ได้นานๆ (เพราะเราจะลบมันเองเมื่อข้อมูลเปลี่ยน)
+const cache = new NodeCache({ stdTTL: 86400 }); // เก็บไว้ 1 วันเต็มๆ
 
-// ID ของไฟล์ Google Sheets ทั้ง 5 ไฟล์ (เปลี่ยนเป็น ID จริงของคุณถ้ายังไม่ได้ใส่)
+// เก็บรายชื่อหน้าเว็บ (Clients) ที่กำลังเชื่อมต่ออยู่
+let connectedClients = [];
+
 const SHEET_FILES = {
   DIAMOND: "1yT_Af7VEUC6sQpJrVxynlMvimkpGUR3dVdC9BJQ_cHU",
   PLATINUM: "1ynB3NvU_aZB8DyW5E_ua7Qfap2BOPYBC1qSulgnmRkI",
@@ -28,14 +27,9 @@ const SHEET_FILES = {
   BRONZE: "10VcaFvq9Ip0Bj4EKg9F51RKFx5DhgfdDT9hAzWmWz7E"
 };
 
-// ==========================================
-// ระบบอ่าน Credentials อย่างปลอดภัย (Local vs Production)
-// ==========================================
 let auth;
-
 try {
     if (process.env.GOOGLE_CREDENTIALS) {
-        // [โหมด Production บน Render.com] อ่านจาก Environment Variable
         console.log("Using credentials from Environment Variable.");
         const credentials = JSON.parse(process.env.GOOGLE_CREDENTIALS);
         auth = new google.auth.GoogleAuth({
@@ -43,14 +37,13 @@ try {
             scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
         });
     } else if (fs.existsSync('./credentials.json')) {
-        // [โหมดทดสอบในเครื่อง] อ่านจากไฟล์ credentials.json
         console.log("Using credentials from credentials.json file.");
         auth = new google.auth.GoogleAuth({
             keyFile: './credentials.json',
             scopes: ['https://www.googleapis.com/auth/spreadsheets.readonly'],
         });
     } else {
-        throw new Error("ไม่พบข้อมูล Credentials! กรุณาใส่ไฟล์ credentials.json หรือตั้งค่า GOOGLE_CREDENTIALS");
+        console.warn("No credentials found!");
     }
 } catch (err) {
     console.error("Authentication Error:", err.message);
@@ -58,9 +51,6 @@ try {
 
 const sheetsApi = google.sheets({ version: 'v4', auth });
 
-// ==========================================
-// ฟังก์ชันดึงข้อมูลจาก Sheets แบบคู่ขนาน (Parallel)
-// ==========================================
 async function fetchAllData() {
   let allData = [];
   const ranks = Object.keys(SHEET_FILES);
@@ -116,13 +106,10 @@ async function fetchAllData() {
       console.error(`Error reading Rank ${rank}:`, error.message);
     }
   }));
-
   return allData;
 }
 
-// ==========================================
-// API Endpoint
-// ==========================================
+// 1. API สำหรับดึงข้อมูลรายชื่อ
 app.get('/api/customers', async (req, res) => {
   try {
     const cachedData = cache.get('CUSTOMER_DATA');
@@ -131,23 +118,52 @@ app.get('/api/customers', async (req, res) => {
     }
 
     const data = await fetchAllData();
-    
-    // ตั้งค่า Cache
     cache.set('CUSTOMER_DATA', data);
-    
     res.json({ source: 'sheets', data: data });
   } catch (error) {
     console.error(error);
-    res.status(500).json({ error: 'Internal Server Error', details: error.message });
+    res.status(500).json({ error: 'Internal Server Error' });
   }
 });
 
-// หน้าเช็คสถานะ API พื้นฐาน
-app.get('/', (req, res) => {
-    res.send("API is running! 🚀 ไปที่ /api/customers เพื่อดูข้อมูล");
+// 2. API สำหรับกระจายสัญญาณให้หน้าเว็บ (Server-Sent Events)
+app.get('/api/stream', (req, res) => {
+  // ตั้งค่าให้เชื่อมต่อค้างไว้แบบ Real-time
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Connection', 'keep-alive');
+  
+  // ส่งข้อความแรกเพื่อยืนยันการเชื่อมต่อ
+  res.write(`data: connected\n\n`);
+
+  // เก็บ Client นี้ไว้ในระบบ
+  connectedClients.push(res);
+
+  // เมื่อผู้ใช้ปิดหน้าเว็บ ให้ลบออกจากระบบ
+  req.on('close', () => {
+    connectedClients = connectedClients.filter(client => client !== res);
+  });
 });
 
-// รัน Server
+// 3. API สำหรับรับสัญญาณจาก Google Sheets (Webhook)
+app.post('/api/webhook/update', (req, res) => {
+  console.log("⚡ ได้รับสัญญาณการเปลี่ยนแปลงจาก Google Sheets!");
+  
+  // ล้างความจำ Cache ทิ้ง เพื่อให้รอบต่อไปไปดึงข้อมูลใหม่
+  cache.del('CUSTOMER_DATA');
+  
+  // กระซิบบอกหน้าเว็บทุกเครื่องที่เปิดอยู่ให้ "ดึงข้อมูลใหม่เดี๋ยวนี้!"
+  connectedClients.forEach(client => {
+    client.write(`data: UPDATE_NOW\n\n`);
+  });
+
+  res.status(200).send("Webhook received and cache cleared");
+});
+
+app.get('/', (req, res) => {
+    res.send("API is running! 🚀");
+});
+
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, () => {
   console.log(`🚀 Server is running on port ${PORT}`);
